@@ -32,7 +32,7 @@ async fn main() {
     let clients_filter = warp::any().map(move || clients.clone());
 
     // WebSocket handler
-    let ws_route = warp::path("ws")
+    let ws_route = warp::path("subscribe")
         .and(warp::ws())
         .and(clients_filter.clone())
         .map(|ws: warp::ws::Ws, clients| {
@@ -40,7 +40,7 @@ async fn main() {
         });
 
     // POST handler
-    let post_route = warp::path("broadcast")
+    let post_route = warp::path("emit")
         .and(warp::post())
         .and(warp::body::json())
         .and(clients_filter.clone())
@@ -52,8 +52,8 @@ async fn main() {
         .with(warp::cors().allow_any_origin());
 
     println!("Server started at http://127.0.0.1:3030");
-    println!("WebSocket endpoint: ws://127.0.0.1:3030/ws");
-    println!("POST endpoint: http://127.0.0.1:3030/broadcast");
+    println!("WebSocket endpoint: ws://127.0.0.1:3030/subscribe");
+    println!("POST endpoint: http://127.0.0.1:3030/emit");
     
     warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
