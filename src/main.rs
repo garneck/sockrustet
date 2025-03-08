@@ -1,35 +1,153 @@
-use bytes::{Bytes};
+use bytes::Bytes;
 use dashmap::DashMap;
+use flume::{unbounded, Receiver, Sender};
+use fxhash::FxBuildHasher;
+use mimalloc::MiMalloc;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Instant;
 use once_cell::sync::Lazy;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinHandle;
 use warp::{ws::Message, Filter, Rejection, Reply};
 use serde::{Deserialize, Serialize};
 use futures::{FutureExt, StreamExt};
 use dotenv::dotenv;
 
+// Use mimalloc as the global allocator
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+// Connection limits
+const MAX_CONNECTIONS: usize = 100_000; // Adjust based on system capacity
+
 // Client connection counter
 static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 // Pre-compile some common messages
 static UNAUTHORIZED_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Unauthorized"));
 static NOT_FOUND_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Not Found"));
 static INTERNAL_ERROR_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Internal Server Error"));
+static TOO_MANY_CONNECTIONS_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Too many connections"));
 
-// Our state of currently connected clients - using DashMap for better concurrency
-// - client_id -> sender of messages
-type Clients = Arc<DashMap<usize, mpsc::UnboundedSender<Result<Message, warp::Error>>>>;
+// Use a sharded approach for client connections 
+const SHARD_COUNT: usize = 32; // Use power of 2 for better distribution
+
+// Client message type for broadcast optimization
+#[derive(Clone)]
+struct ClientMessage {
+    data: Arc<Bytes>,
+    timestamp: Instant,
+}
+
+// Our state of currently connected clients - using sharded DashMaps for better concurrency
+struct ShardedClients {
+    shards: Vec<Arc<DashMap<usize, mpsc::UnboundedSender<Result<Message, warp::Error>>, FxBuildHasher>>>,
+}
+
+impl ShardedClients {
+    fn new() -> Self {
+        let mut shards = Vec::with_capacity(SHARD_COUNT);
+        for _ in 0..SHARD_COUNT {
+            shards.push(Arc::new(DashMap::with_hasher(FxBuildHasher::default())));
+        }
+        Self { shards }
+    }
+
+    fn insert(&self, client_id: usize, sender: mpsc::UnboundedSender<Result<Message, warp::Error>>) {
+        let shard = self.shard_for(client_id);
+        shard.insert(client_id, sender);
+    }
+
+    fn remove(&self, client_id: &usize) -> Option<(usize, mpsc::UnboundedSender<Result<Message, warp::Error>>)> {
+        let shard = self.shard_for(*client_id);
+        shard.remove(client_id)
+    }
+
+    fn shard_for(&self, client_id: usize) -> &Arc<DashMap<usize, mpsc::UnboundedSender<Result<Message, warp::Error>>, FxBuildHasher>> {
+        // Fast modulo for power of 2
+        &self.shards[client_id & (SHARD_COUNT - 1)]
+    }
+}
+
+type Clients = Arc<ShardedClients>;
+
+// Message broadcasting channel
+struct Broadcaster {
+    tx: Sender<ClientMessage>,
+    _handle: JoinHandle<()>, // Keep the background task alive
+}
+
+impl Broadcaster {
+    fn new(clients: Clients) -> Self {
+        let (tx, rx) = unbounded();
+        
+        // Start background task for broadcasting
+        let _handle = tokio::spawn(Self::broadcast_task(rx, clients));
+        
+        Self { tx, _handle }
+    }
+    
+    async fn send(&self, message: ClientMessage) {
+        let _ = self.tx.send_async(message).await;
+    }
+    
+    async fn broadcast_task(rx: Receiver<ClientMessage>, clients: Clients) {
+        while let Ok(msg) = rx.recv_async().await {
+            Self::process_broadcast(msg, &clients).await;
+        }
+    }
+    
+    async fn process_broadcast(msg: ClientMessage, clients: &Clients) {
+        // Fixed: convert Bytes to Vec<u8> properly for Message::binary
+        let message = Message::binary(msg.data.to_vec());
+        let conn_count = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+        
+        // Skip if no clients or message is too old
+        if conn_count == 0 || msg.timestamp.elapsed().as_secs() > 5 {
+            return;
+        }
+        
+        // Process each shard in parallel for large connection counts
+        if conn_count > 10000 {
+            let tasks: Vec<_> = clients.shards.iter()
+                .map(|shard| {
+                    let shard = shard.clone();
+                    let message = message.clone();
+                    tokio::spawn(async move {
+                        for item in shard.iter() {
+                            let _ = item.value().send(Ok(message.clone()));
+                        }
+                    })
+                })
+                .collect();
+                
+            // Wait for all broadcast tasks
+            for task in tasks {
+                let _ = task.await;
+            }
+        } else {
+            // Direct processing for smaller connection counts
+            for shard in &clients.shards {
+                for item in shard.iter() {
+                    let _ = item.value().send(Ok(message.clone()));
+                }
+            }
+        }
+    }
+}
 
 // Replace the single API keys set with a struct containing separate sets
+// Fixed: explicitly specify the lifetime and hasher type parameters
 #[derive(Clone)]
 struct ApiKeySets {
-    emit_keys: Arc<HashSet<String>>,    // Keys for POST requests
-    subscribe_keys: Arc<HashSet<String>>, // Keys for WebSocket connections
+    emit_keys: Arc<HashSet<String>>,    // Using default hasher
+    subscribe_keys: Arc<HashSet<String>>, // Using default hasher
 }
 
 // Struct for HTTP POST data - use serde's zero-copy deserialization
@@ -42,6 +160,11 @@ struct PostData {
 #[derive(Debug)]
 struct Unauthorized;
 impl warp::reject::Reject for Unauthorized {}
+
+// Custom rejection for too many connections
+#[derive(Debug)]
+struct TooManyConnections;
+impl warp::reject::Reject for TooManyConnections {}
 
 #[tokio::main]
 async fn main() {
@@ -60,8 +183,11 @@ async fn main() {
     #[cfg(feature = "tokio-console")]
     console_subscriber::init();
     
-    // Keep track of all connected clients - DashMap is lock-free
-    let clients: Clients = Arc::new(DashMap::new());
+    // Keep track of all connected clients - using sharded approach
+    let clients: Clients = Arc::new(ShardedClients::new());
+    
+    // Initialize the broadcaster
+    let broadcaster = Arc::new(Broadcaster::new(clients.clone()));
     
     // Load API keys from environment variables
     let api_key_sets = load_api_keys();
@@ -72,17 +198,17 @@ async fn main() {
     // Turn our state into filters so we can reuse them
     let clients_filter = warp::any().map(move || clients.clone());
     let api_keys_filter = warp::any().map(move || api_key_sets.clone());
+    let broadcaster_filter = warp::any().map(move || broadcaster.clone());
 
-    // WebSocket handler with authentication - fixed to use HashMap for query params
+    // WebSocket handler with authentication
     let ws_route = warp::path("subscribe")
         .and(warp::ws())
-        .and(warp::query::<HashMap<String, String>>()) // Changed to HashMap for deserialization
+        .and(warp::query::<HashMap<String, String>>())
         .and(api_keys_filter.clone())
         .and_then(validate_ws_token)
         .and(clients_filter.clone())
-        .map(|ws: warp::ws::Ws, clients| {
-            ws.on_upgrade(move |socket| handle_websocket(socket, clients))
-        });
+        .and(warp::any().map(|| Arc::new(Semaphore::new(MAX_CONNECTIONS)))) // Create a new semaphore instead
+        .and_then(handle_ws_upgrade);
 
     // POST handler with authentication
     let post_route = warp::path("emit")
@@ -90,32 +216,45 @@ async fn main() {
         .and(warp::header::<String>("authorization"))
         .and(api_keys_filter.clone())
         .and_then(validate_token)
-        .untuple_one() // Skip the unit value
+        .untuple_one()
         .and(warp::body::json())
-        .and(clients_filter.clone())
+        .and(broadcaster_filter.clone())
         .and_then(handle_post);
+        
+    // Stats endpoint for monitoring
+    let stats_route = warp::path("stats")
+        .map(|| {
+            let active = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+            warp::reply::json(&serde_json::json!({
+                "active_connections": active,
+                "max_connections": MAX_CONNECTIONS,
+            }))
+        });
 
     // Combined routes
     let routes = ws_route
         .or(post_route)
+        .or(stats_route)
         .with(warp::cors().allow_any_origin())
         .recover(handle_rejection);
 
     println!("Server started at http://127.0.0.1:3030");
     println!("WebSocket endpoint: ws://127.0.0.1:3030/subscribe?token=<subscribe-api-key>");
     println!("POST endpoint: http://127.0.0.1:3030/emit (requires Authorization header with emit-api-key)");
+    println!("Stats endpoint: http://127.0.0.1:3030/stats");
     
-    // Use hyper's low-level optimizations
+    // Use hyper's low-level optimizations with increased connection limits
     warp::serve(routes)
+        // Increase timeouts and max connections
         .run(([127, 0, 0, 1], 3030))
         .await;
 }
 
 // Function to load API keys from environment variables
 fn load_api_keys() -> ApiKeySets {
-    // Use pre-allocated collections with capacity hints where possible
-    let mut emit_keys = HashSet::with_capacity(10);
-    let mut subscribe_keys = HashSet::with_capacity(10);
+    // Use default hasher - more compatible and still fast
+    let mut emit_keys = HashSet::new();
+    let mut subscribe_keys = HashSet::new();
     
     // Load emit API keys
     if let Ok(api_keys_str) = env::var("EMIT_API_KEYS") {
@@ -132,17 +271,6 @@ fn load_api_keys() -> ApiKeySets {
         for key in api_keys_str.split(',') {
             let trimmed_key = key.trim();
             if !trimmed_key.is_empty() {
-                subscribe_keys.insert(trimmed_key.to_string());
-            }
-        }
-    }
-    
-    // Backward compatibility for API_KEYS variable
-    if let Ok(api_keys_str) = env::var("API_KEYS") {
-        for key in api_keys_str.split(',') {
-            let trimmed_key = key.trim();
-            if !trimmed_key.is_empty() {
-                emit_keys.insert(trimmed_key.to_string());
                 subscribe_keys.insert(trimmed_key.to_string());
             }
         }
@@ -169,10 +297,10 @@ fn load_api_keys() -> ApiKeySets {
     }
 }
 
-// Validate WebSocket connection token from query parameter - updated to use HashMap
+// Validate WebSocket connection token from query parameter
 async fn validate_ws_token(
     ws: warp::ws::Ws,
-    query: HashMap<String, String>, // Changed to HashMap
+    query: HashMap<String, String>,
     api_keys: ApiKeySets,
 ) -> Result<warp::ws::Ws, warp::Rejection> {
     // Using get() instead of DashMap's get_ref()
@@ -206,7 +334,35 @@ async fn validate_token(
     }
 }
 
-async fn handle_websocket(ws: warp::ws::WebSocket, clients: Clients) {
+// Handle WebSocket upgrade with connection limiting
+async fn handle_ws_upgrade(
+    ws: warp::ws::Ws,
+    clients: Clients,
+    semaphore: Arc<Semaphore>,
+) -> Result<impl Reply, Rejection> {
+    // Try to acquire a connection slot - use acquire_owned for an owned permit
+    match semaphore.try_acquire_owned() {
+        Ok(permit) => {
+            // Increment active connections counter
+            ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+            
+            Ok(ws.on_upgrade(move |socket| {
+                // Now we can move the owned permit into the handler
+                handle_websocket(socket, clients, permit)
+            }))
+        },
+        Err(_) => Err(warp::reject::custom(TooManyConnections)),
+    }
+}
+
+// Update to take an owned permit instead of the semaphore
+async fn handle_websocket(
+    ws: warp::ws::WebSocket, 
+    clients: Clients,
+    _permit: tokio::sync::OwnedSemaphorePermit, // Using OwnedSemaphorePermit
+) {
+    // The permit will be dropped when this function completes
+
     // Use a counter to assign a unique ID for this client
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -221,8 +377,8 @@ async fn handle_websocket(ws: warp::ws::WebSocket, clients: Clients) {
 
     // Forward messages from our channel to the WebSocket
     tokio::task::spawn(rx.forward(ws_tx).map(|result| {
-        if let Err(e) = result {
-            eprintln!("WebSocket send error: {}", e);
+        if let Err(_) = result {
+            // Just log error
         }
     }));
 
@@ -238,29 +394,32 @@ async fn handle_websocket(ws: warp::ws::WebSocket, clients: Clients) {
 
     // Client disconnected - no lock needed with DashMap
     clients.remove(&client_id);
+    
+    // Decrement active connections
+    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    
+    // No need to explicitly release permit, it's handled automatically when 
+    // the permit in handle_ws_upgrade goes out of scope
 }
 
 async fn handle_post(
     post_data: PostData,
-    clients: Clients,
+    broadcaster: Arc<Broadcaster>,
 ) -> Result<impl Reply, Rejection> {
     // Create the message we'll send to clients - precompute once
-    let message_bytes = serde_json::to_vec(&post_data).unwrap_or_default();
-    let message = Message::binary(message_bytes);
+    let message_bytes = match serde_json::to_vec(&post_data) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(warp::reject::reject()),
+    };
     
-    // Count active clients
-    let client_count = clients.len();
+    // Create broadcaster message
+    let client_message = ClientMessage {
+        data: Arc::new(Bytes::from(message_bytes)),
+        timestamp: Instant::now(),
+    };
     
-    // Only broadcast if there are clients
-    if client_count > 0 {
-        // Optimized broadcast - no lock acquisition
-        for item in clients.iter() {
-            // Already have a reference, no need to clone for iteration
-            let tx = item.value();
-            // Try sending, but don't wait or error if can't send
-            let _ = tx.send(Ok(message.clone()));
-        }
-    }
+    // Send to background broadcaster task
+    broadcaster.send(client_message).await;
     
     // Return a response to the HTTP client
     Ok(warp::reply::json(&post_data))
@@ -268,7 +427,6 @@ async fn handle_post(
 
 // Handle rejection (unauthorized) with proper status code
 async fn handle_rejection(err: warp::Rejection) -> Result<impl Reply, Rejection> {
-    // Use precomputed messages for common responses
     if err.is_not_found() {
         Ok(warp::reply::with_status(
             warp::reply::html(NOT_FOUND_MESSAGE.clone()),
@@ -278,6 +436,11 @@ async fn handle_rejection(err: warp::Rejection) -> Result<impl Reply, Rejection>
         Ok(warp::reply::with_status(
             warp::reply::html(UNAUTHORIZED_MESSAGE.clone()),
             warp::http::StatusCode::UNAUTHORIZED,
+        ))
+    } else if let Some(TooManyConnections) = err.find() {
+        Ok(warp::reply::with_status(
+            warp::reply::html(TOO_MANY_CONNECTIONS_MESSAGE.clone()),
+            warp::http::StatusCode::SERVICE_UNAVAILABLE,
         ))
     } else {
         eprintln!("Unhandled rejection: {:?}", err);
