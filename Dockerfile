@@ -6,9 +6,10 @@ FROM rustlang/rust:nightly-slim AS builder
 # Enable strict mode
 SHELL ["/bin/sh", "-e", "-c"]
 
-# Optimize for build speed
+# Optimize for build speed - use all CPU cores
 ENV RUSTFLAGS="-C codegen-units=16 -C opt-level=1 -C target-feature=+crt-static"
-ENV CARGO_BUILD_JOBS=0
+# Use all available cores for faster builds (default value)
+# Not setting CARGO_BUILD_JOBS will let cargo decide automatically
 
 WORKDIR /app
 
