@@ -14,7 +14,7 @@ env:
 
 jobs:
   build:
-    runs-on: self-hosted
+    runs-on: [self-hosted]
     permissions:
       contents: read
       packages: write
@@ -25,21 +25,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # Enhanced QEMU setup for ARM64
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
-        with:
-          platforms: arm64
-          image: tonistiigi/binfmt:latest
-          static: true
+      # No need for QEMU setup since we're on native ARM64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
         with:
-          # Create a builder that persists cache between runs
           driver-opts: |
             network=host
-            image=moby/buildkit:buildx-stable-1
           buildkitd-flags: --debug
 
       - name: Login to DockerHub
@@ -79,12 +71,10 @@ jobs:
           # Optimizations for faster builds
           provenance: false
           sbom: false
-          # Set BuildKit options for performance
           build-args: |
             BUILDKIT_INLINE_CACHE=1
             DOCKER_BUILDKIT=1
-          # Reduced timeout
-          timeout-minutes: 30
+          timeout-minutes: 15
           no-cache: false
           pull: true
           network: host
