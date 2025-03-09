@@ -1,5 +1,5 @@
-# Use a multi-arch Rust image as the base
-FROM rust:1.75-slim-bullseye AS builder
+# Use nightly Rust image to support edition2024
+FROM rustlang/rust:nightly-slim-bullseye AS builder
 
 # Install cross-compilation tools for ARM64
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,6 +12,9 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
 ENV RUSTFLAGS="-C codegen-units=1 -C debuginfo=0 -C opt-level=3"
 ENV CARGO_BUILD_JOBS=1
+
+# Add the target for cross-compilation
+RUN rustup target add aarch64-unknown-linux-gnu
 
 WORKDIR /app
 
