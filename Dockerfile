@@ -31,11 +31,8 @@ COPY . .
 RUN rustup target add aarch64-unknown-linux-musl && \
     cargo build --release --target aarch64-unknown-linux-musl
 
-# Runtime stage using Alpine
-FROM alpine:3.21
-
-# Install minimal runtime dependencies
-RUN apk add --no-cache ca-certificates tzdata
+# Runtime stage using scratch (minimal image)
+FROM scratch
 
 WORKDIR /app
 
@@ -49,4 +46,4 @@ ENV RUST_LOG=info
 EXPOSE 3030
 
 # Run the binary
-CMD ["/app/sockrustet"]
+ENTRYPOINT ["/app/sockrustet"]
