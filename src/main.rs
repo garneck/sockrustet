@@ -30,10 +30,10 @@ static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 // Pre-compile some common messages as static bytes to avoid runtime allocations
-static UNAUTHORIZED_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Unauthorized"));
-static NOT_FOUND_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Not Found"));
-static INTERNAL_ERROR_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Internal Server Error"));
-static TOO_MANY_CONNECTIONS_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Too many connections"));
+static UNAUTHORIZED_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"{\"error\":\"Unauthorized\",\"message\":\"Invalid or missing authentication token\"}"));
+static NOT_FOUND_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"{\"error\":\"Not Found\",\"message\":\"The requested resource was not found\"}"));
+static INTERNAL_ERROR_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"{\"error\":\"Internal Server Error\",\"message\":\"An unexpected error occurred\"}"));
+static TOO_MANY_CONNECTIONS_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"{\"error\":\"Service Unavailable\",\"message\":\"Too many connections, please try again later\"}"));
 
 // Optimize sharding for better parallelism and cache efficiency
 const SHARD_COUNT: usize = 128; // Increased from 32 to 128 for better distribution
@@ -575,35 +575,39 @@ async fn handle_post(
 async fn handle_rejection(err: warp::Rejection) -> Result<impl Reply, Rejection> {
     if err.is_not_found() {
         Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({
-                "error": "Not Found",
-                "message": "The requested resource was not found"
-            })),
+            warp::reply::with_header(
+                NOT_FOUND_MESSAGE.to_vec(),
+                "content-type",
+                "application/json"
+            ),
             warp::http::StatusCode::NOT_FOUND,
         ))
     } else if let Some(Unauthorized) = err.find() {
         Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({
-                "error": "Unauthorized",
-                "message": "Invalid or missing authentication token"
-            })),
+            warp::reply::with_header(
+                UNAUTHORIZED_MESSAGE.to_vec(),
+                "content-type",
+                "application/json"
+            ),
             warp::http::StatusCode::UNAUTHORIZED,
         ))
     } else if let Some(TooManyConnections) = err.find() {
         Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({
-                "error": "Service Unavailable",
-                "message": "Too many connections, please try again later"
-            })),
+            warp::reply::with_header(
+                TOO_MANY_CONNECTIONS_MESSAGE.to_vec(),
+                "content-type",
+                "application/json"
+            ),
             warp::http::StatusCode::SERVICE_UNAVAILABLE,
         ))
     } else {
         eprintln!("Unhandled rejection: {:?}", err);
         Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({
-                "error": "Internal Server Error",
-                "message": "An unexpected error occurred"
-            })),
+            warp::reply::with_header(
+                INTERNAL_ERROR_MESSAGE.to_vec(),
+                "content-type",
+                "application/json"
+            ),
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
         ))
     }
