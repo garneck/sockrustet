@@ -575,23 +575,35 @@ async fn handle_post(
 async fn handle_rejection(err: warp::Rejection) -> Result<impl Reply, Rejection> {
     if err.is_not_found() {
         Ok(warp::reply::with_status(
-            warp::reply::html(NOT_FOUND_MESSAGE.clone()),
+            warp::reply::json(&serde_json::json!({
+                "error": "Not Found",
+                "message": "The requested resource was not found"
+            })),
             warp::http::StatusCode::NOT_FOUND,
         ))
     } else if let Some(Unauthorized) = err.find() {
         Ok(warp::reply::with_status(
-            warp::reply::html(UNAUTHORIZED_MESSAGE.clone()),
+            warp::reply::json(&serde_json::json!({
+                "error": "Unauthorized",
+                "message": "Invalid or missing authentication token"
+            })),
             warp::http::StatusCode::UNAUTHORIZED,
         ))
     } else if let Some(TooManyConnections) = err.find() {
         Ok(warp::reply::with_status(
-            warp::reply::html(TOO_MANY_CONNECTIONS_MESSAGE.clone()),
+            warp::reply::json(&serde_json::json!({
+                "error": "Service Unavailable",
+                "message": "Too many connections, please try again later"
+            })),
             warp::http::StatusCode::SERVICE_UNAVAILABLE,
         ))
     } else {
         eprintln!("Unhandled rejection: {:?}", err);
         Ok(warp::reply::with_status(
-            warp::reply::html(INTERNAL_ERROR_MESSAGE.clone()),
+            warp::reply::json(&serde_json::json!({
+                "error": "Internal Server Error",
+                "message": "An unexpected error occurred"
+            })),
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
         ))
     }
