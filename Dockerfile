@@ -1,5 +1,7 @@
-# Use nightly Rust image for ARM64
-FROM --platform=linux/arm64 rustlang/rust:nightly-slim AS builder
+# Use nightly Rust image
+ARG TARGETPLATFORM
+
+FROM rustlang/rust:nightly-slim AS builder
 
 # Enable strict mode
 SHELL ["/bin/sh", "-e", "-c"]
