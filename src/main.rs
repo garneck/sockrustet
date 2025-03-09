@@ -171,12 +171,6 @@ async fn main() {
     // Load .env file if available
     dotenv().ok();
     
-    // Initialize logging with filter for production
-    if env::var("PRODUCTION").is_ok() {
-        std::env::set_var("RUST_LOG", "warn");
-    } else {
-        std::env::set_var("RUST_LOG", "info");
-    }
     pretty_env_logger::init();
     
     // Fix for console_subscriber - only initialize if feature is enabled
@@ -238,15 +232,15 @@ async fn main() {
         .with(warp::cors().allow_any_origin())
         .recover(handle_rejection);
 
-    println!("Server started at http://127.0.0.1:3030");
-    println!("WebSocket endpoint: ws://127.0.0.1:3030/subscribe?token=<subscribe-api-key>");
-    println!("POST endpoint: http://127.0.0.1:3030/emit (requires Authorization header with emit-api-key)");
-    println!("Stats endpoint: http://127.0.0.1:3030/stats");
+    println!("Server started at http://0.0.0.0:3030");
+    println!("WebSocket endpoint: ws://0.0.0.0:3030/subscribe?token=<subscribe-api-key>");
+    println!("POST endpoint: http://0.0.0.0:3030/emit (requires Authorization header with emit-api-key)");
+    println!("Stats endpoint: http://0.0.0.0:3030/stats");
     
     // Use hyper's low-level optimizations with increased connection limits
     warp::serve(routes)
         // Increase timeouts and max connections
-        .run(([127, 0, 0, 1], 3030))
+        .run(([0, 0, 0, 0], 3030))
         .await;
 }
 
