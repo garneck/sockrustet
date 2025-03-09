@@ -76,9 +76,12 @@ jobs:
           # Optimizations for scratch image
           provenance: false
           sbom: false
-          # Show build progress
+          # Show build progress and add timeouts
           build-args: |
             BUILDKIT_INLINE_CACHE=1
-          # Add fail-fast
+            DOCKER_TIMEOUT=30m
+          # Add fail-fast and resource constraints
           builder-to-load-args: |
             --progress=plain
+          # Allow more time for ARM64 builds
+          timeout-minutes: 60
