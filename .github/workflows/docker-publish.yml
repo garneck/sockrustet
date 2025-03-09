@@ -33,6 +33,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
+      # Cache Rust dependencies more efficiently
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Login to DockerHub
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v2
@@ -59,13 +72,15 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Multi-architecture build
           platforms: linux/amd64,linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Improved cache configuration
+          cache-from: type=gha,scope=${{ github.workflow }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}
           # Optimizations for scratch image
           provenance: false
           sbom: false
+          # Build in parallel to save time
+          parallel: true
           # Add fail-fast
           builder-to-load-args: |
             --progress=plain
