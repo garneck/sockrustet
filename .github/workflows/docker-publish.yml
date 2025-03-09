@@ -68,7 +68,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/arm64
-          # Improved cache configuration - use a registry cache
           cache-from: |
             type=gha,scope=docker-build-arm64-${{ github.ref_name }}
             type=gha,scope=docker-build-arm64-main
@@ -76,12 +75,18 @@ jobs:
           # Optimizations for scratch image
           provenance: false
           sbom: false
-          # Show build progress and add timeouts
+          # Use host networking and max parallelism for faster builds
           build-args: |
             BUILDKIT_INLINE_CACHE=1
             DOCKER_TIMEOUT=30m
-          # Add fail-fast and resource constraints
+            CARGO_BUILD_RUSTFLAGS="-C codegen-units=1 -C debuginfo=0"
           builder-to-load-args: |
             --progress=plain
-          # Allow more time for ARM64 builds
-          timeout-minutes: 60
+          # Increase timeout for ARM64 builds
+          timeout-minutes: 90
+          # Add optimization flags
+          no-cache: false
+          pull: true
+          network: host
+          allow: |
+            network.host

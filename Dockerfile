@@ -1,79 +1,41 @@
-# Build stage with optimized settings for arm64 target
-FROM rust:1.85-alpine AS builder
+# Use cross-rs image which is optimized for cross-compilation
+FROM rustembedded/cross:aarch64-unknown-linux-musl-0.2.5 AS builder
 
 # Enable strict mode in shell commands
 SHELL ["/bin/sh", "-e", "-c"]
 
-# Install build dependencies
-RUN set -eo pipefail && \
-    apk add --no-cache musl-dev openssl-dev pkgconfig build-base gcc wget tar
-
-# Set target to arm64 only
-RUN echo "aarch64-unknown-linux-musl" > /target.txt && \
-    echo "Building for $(cat /target.txt)"
-
-# Setup ARM64 cross-compilation - optimize with more debug output
-RUN TARGET=$(cat /target.txt) && \
-    # Install ARM64 cross-compilation toolchain
-    wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | tar -xzC /opt/ && \
-    # Configure Cargo for cross-compilation with optimized settings
-    mkdir -p ~/.cargo && \
-    echo "[target.$TARGET]" >> ~/.cargo/config && \
-    echo "linker = \"aarch64-linux-musl-gcc\"" >> ~/.cargo/config && \
-    echo "ar = \"aarch64-linux-musl-ar\"" >> ~/.cargo/config && \
-    # Limit parallel jobs to prevent memory issues
-    echo "rustflags = [\"-C\", \"target-feature=+crt-static\", \"-C\", \"codegen-units=1\"]" >> ~/.cargo/config && \
-    # Set environment variables for cross-compilation
-    echo "export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> /env.sh && \
-    echo "export CXX_aarch64_unknown_linux_musl=aarch64-linux-musl-g++" >> /env.sh && \
-    echo "export AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar" >> /env.sh && \
-    echo "export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> /env.sh && \
-    echo "export PATH=/opt/aarch64-linux-musl-cross/bin:\$PATH" >> /env.sh && \
-    # Set cargo environment variables to prevent memory issues
-    echo "export CARGO_BUILD_JOBS=1" >> /env.sh && \
-    echo "export CARGO_NET_RETRY=5" >> /env.sh && \
-    # Add the rust target
-    rustup target add $(cat /target.txt)
+# Reduce debug info to speed up compilation
+ENV CARGO_PROFILE_RELEASE_DEBUG=0
+ENV RUSTFLAGS="-C codegen-units=1 -C debuginfo=0 -C opt-level=3 -C target-feature=+crt-static"
+ENV CARGO_BUILD_JOBS=1
 
 WORKDIR /app
 
-# Create a dummy main.rs that doesn't need to compile our whole app
-# but will still download our dependencies
+# Copy only the files needed to build dependencies
 COPY Cargo.toml Cargo.lock ./
+
+# Create a dummy project to build dependencies
 RUN mkdir -p src && \
-    echo 'fn main() { println!("Dummy build"); }' > src/main.rs
+    echo 'fn main() { println!("Dependency build"); }' > src/main.rs && \
+    cargo build --target aarch64-unknown-linux-musl --release && \
+    rm -rf src/ target/aarch64-unknown-linux-musl/release/deps/sockrustet*
 
-# Build dependencies only - this layer gets cached - with better error handling
-RUN TARGET=$(cat /target.txt) && \
-    source /env.sh && \
-    echo "Building dependencies with target $TARGET..." && \
-    # Set timeout for cargo commands
-    timeout 600s cargo build --release --target $TARGET || (echo "Dependency build failed or timed out" && exit 1) && \
-    # Clean up artifacts but keep dependencies
-    cargo clean --release --target $TARGET --package sockrustet && \
-    rm -rf src/
-
-# Now copy the actual source code
+# Copy actual source
 COPY src/ src/
 
-# Build with static linking for arm64 target - with better error handling and debugging
-RUN TARGET=$(cat /target.txt) && \
-    source /env.sh && \
-    echo "Starting final build for $TARGET..." && \
-    # Use verbose output to see what's happening
-    RUST_BACKTRACE=1 timeout 600s cargo build --release --target $TARGET -v || (echo "Final build failed or timed out" && exit 1) && \
-    echo "Checking if binary exists..." && \
-    ls -la target/$(cat /target.txt)/release/ && \
-    # Copy the binary to a predictable location
-    cp target/$(cat /target.txt)/release/sockrustet /app/sockrustet.bin && \
-    echo "Binary successfully built and copied!"
+# Optimize the final build - use LTO thin for faster linking but still good optimization
+RUN echo "Starting final build..." && \
+    RUSTFLAGS="$RUSTFLAGS -C lto=thin" \
+    cargo build --target aarch64-unknown-linux-musl --release && \
+    ls -la target/aarch64-unknown-linux-musl/release && \
+    cp target/aarch64-unknown-linux-musl/release/sockrustet /app/sockrustet.bin
 
-# Runtime stage using scratch
+# Runtime stage - using scratch for minimal size
 FROM scratch
 
 WORKDIR /app
 
-# Copy the built executable from the predictable location
+# Copy built binary
 COPY --from=builder /app/sockrustet.bin /app/sockrustet
 
 # Set environment variables for logging
