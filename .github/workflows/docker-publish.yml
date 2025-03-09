@@ -77,18 +77,9 @@ jobs:
           # Optimizations for scratch image
           provenance: false
           sbom: false
-          # Use host networking and max parallelism for faster builds
           build-args: |
             BUILDKIT_INLINE_CACHE=1
-            DOCKER_TIMEOUT=30m
-            CARGO_BUILD_RUSTFLAGS="-C codegen-units=1 -C debuginfo=0"
-            TARGETPLATFORM=linux/arm64
-          # Explicitly set this to avoid platform mismatch
-          build-contexts: |
-            image=docker-image://rustembedded/cross:aarch64-unknown-linux-musl
-          # Increase timeout for ARM64 builds
           timeout-minutes: 90
-          # Add optimization flags
           no-cache: false
           pull: true
           network: host
