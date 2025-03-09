@@ -9,21 +9,11 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the Cargo.toml and Cargo.lock files
-COPY Cargo.toml Cargo.lock ./
+# Copy the entire project
+COPY . .
 
-# Create a dummy main.rs to build dependencies
-RUN mkdir -p src && \
-    echo "fn main() {}" > src/main.rs && \
-    cargo build --release && \
-    rm -rf src
-
-# Copy the actual source code
-COPY src ./src
-
-# Build the application for real
-RUN touch src/main.rs && \
-    cargo build --release
+# Build the application directly
+RUN cargo build --release
 
 # Use Alpine for a small runtime image
 FROM --platform=linux/arm64 alpine:3.18
