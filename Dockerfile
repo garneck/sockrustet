@@ -68,23 +68,17 @@ COPY src/ src/
 # Build with static linking for the appropriate target
 RUN TARGET=$(cat /target.txt) && \
     if [ -f /env.sh ]; then source /env.sh; fi && \
-    cargo build --release --target $TARGET
-
-# Create a special stage to grab the binary from the builder
-FROM scratch as binary-extractor
-ARG TARGETPLATFORM
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/sockrustet* /amd64/
-COPY --from=builder /app/target/aarch64-unknown-linux-musl/release/sockrustet* /arm64/
+    cargo build --release --target $TARGET && \
+    # Copy the binary to a predictable location
+    cp target/$(cat /target.txt)/release/sockrustet /app/sockrustet.bin
 
 # Runtime stage using scratch
 FROM scratch
 
 WORKDIR /app
 
-ARG TARGETPLATFORM
-
-# Copy the built executable based on architecture
-COPY --from=binary-extractor /${TARGETPLATFORM#linux/}/sockrustet /app/
+# Copy the built executable from the predictable location
+COPY --from=builder /app/sockrustet.bin /app/sockrustet
 
 # Set environment variables for logging
 ENV RUST_LOG=info
