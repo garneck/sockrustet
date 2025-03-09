@@ -1,48 +1,40 @@
-# Use the latest Rust image with better proc-macro support
-FROM rust:latest AS builder
+# Use the official Rust image for ARM64 as the builder
+FROM --platform=linux/arm64 rust:1.85-slim as builder
 
-# Enable strict mode
-SHELL ["/bin/sh", "-e", "-c"]
+WORKDIR /usr/src/app
 
-# Install required dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Debug output to verify architecture
-RUN uname -m && \
-    rustc -vV && \
-    rustup show
+# Copy the Cargo.toml and Cargo.lock files
+COPY Cargo.toml Cargo.lock ./
+
+# Create a dummy main.rs to build dependencies
+RUN mkdir -p src && \
+    echo "fn main() {}" > src/main.rs && \
+    cargo build --release && \
+    rm -rf src
+
+# Copy the actual source code
+COPY src ./src
+
+# Build the application for real
+RUN touch src/main.rs && \
+    cargo build --release
+
+# Use Alpine for a small runtime image
+FROM --platform=linux/arm64 alpine:3.18
+
+# Install runtime dependencies
+RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
-# Copy entire project
-COPY . .
-
-# Build with explicit host detection
-RUN echo "Building application..." && \
-    HOST_ARCH=$(uname -m) && \
-    echo "Detected architecture: $HOST_ARCH" && \
-    if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ]; then \
-        echo "Building for ARM64" && \
-        cargo build --release; \
-    else \
-        echo "Architecture not supported directly, using cross-compilation" && \
-        rustup target add aarch64-unknown-linux-gnu && \
-        cargo build --target aarch64-unknown-linux-gnu --release && \
-        cp target/aarch64-unknown-linux-gnu/release/sockrustet target/release/ || true; \
-    fi && \
-    ls -la target/release/ && \
-    cp target/release/sockrustet /app/sockrustet.bin || { echo "Binary not found!"; exit 1; }
-
-# Final stage with distroless for better ARM64 compatibility
-FROM gcr.io/distroless/static:nonroot
-
-WORKDIR /app
-
-# Copy binary
-COPY --from=builder /app/sockrustet.bin /app/sockrustet
+# Copy the binary from the builder stage
+COPY --from=builder /usr/src/app/target/release/sockrustet .
 
 # Set environment variables
 ENV RUST_LOG=info
@@ -51,5 +43,5 @@ ENV RUST_LOG=info
 EXPOSE 3030
 
 # Run the binary
-USER nonroot
-ENTRYPOINT ["/app/sockrustet"]
+CMD ["./sockrustet"]
+

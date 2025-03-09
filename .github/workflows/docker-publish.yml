@@ -1,82 +1,61 @@
-name: Publish Scratch Docker image (ARM64 Only)
+name: Build and Publish Docker Image
 
 on:
   push:
     branches: [main, master]
-    tags: ["v*"]
+    tags: ["v*.*.*"]
   pull_request:
     branches: [main, master]
 
 env:
   REGISTRY: docker.io
   IMAGE_NAME: garneck/sockrustet
-  CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    runs-on: [self-hosted]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: true
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # No need for QEMU setup since we're on native ARM64
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+        with:
+          platforms: "arm64"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
-        with:
-          driver-opts: |
-            network=host
-          buildkitd-flags: --debug
 
-      - name: Login to DockerHub
+      - name: Log in to Docker Hub
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v2
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Extract Docker metadata
+      - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v4
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
             type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=arm64,enable={{is_default_branch}}
 
-      # Build and push using optimized settings for faster builds
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
         with:
           context: .
+          platforms: linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/arm64
-          # Improved caching for faster builds
-          cache-from: |
-            type=gha,scope=docker-build-arm64-${{ github.ref_name }}
-            type=gha,scope=docker-build-arm64-main
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME) || '' }}
-          # Optimizations for faster builds
-          provenance: false
-          sbom: false
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
-            DOCKER_BUILDKIT=1
-          timeout-minutes: 15
-          no-cache: false
-          pull: true
-          network: host
-          allow: |
-            network.host
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
