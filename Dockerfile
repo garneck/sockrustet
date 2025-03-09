@@ -1,5 +1,5 @@
-# Use cross-rs image which is optimized for cross-compilation
-FROM rustembedded/cross:aarch64-unknown-linux-musl AS builder
+# Platform-specific image for ARM64 builds
+FROM --platform=linux/arm64 rustembedded/cross:aarch64-unknown-linux-musl AS builder
 
 # Enable strict mode in shell commands
 SHELL ["/bin/sh", "-e", "-c"]
