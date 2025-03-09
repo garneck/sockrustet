@@ -61,7 +61,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=arm64,enable={{is_default_branch}}
 
-      # Build and push using scratch-optimized settings (ARM64 only)
+      # Build and push using optimized settings for faster builds
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
         with:
@@ -70,16 +70,21 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/arm64
+          # Improved caching for faster builds
           cache-from: |
             type=gha,scope=docker-build-arm64-${{ github.ref_name }}
             type=gha,scope=docker-build-arm64-main
-          cache-to: type=gha,mode=max,scope=docker-build-arm64-${{ github.ref_name }}
-          # Optimizations for scratch image
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME) || '' }}
+          # Optimizations for faster builds
           provenance: false
           sbom: false
+          # Set BuildKit options for performance
           build-args: |
             BUILDKIT_INLINE_CACHE=1
-          timeout-minutes: 90
+            DOCKER_BUILDKIT=1
+          # Reduced timeout
+          timeout-minutes: 30
           no-cache: false
           pull: true
           network: host
