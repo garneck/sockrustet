@@ -1,8 +1,8 @@
-# Enable strict mode in shell commands with set -e to fail fast
-SHELL ["/bin/sh", "-e", "-c"]
-
 # Build stage with cargo-chef for optimization
 FROM rust:1.85-alpine AS builder
+
+# Enable strict mode in shell commands with set -e to fail fast
+SHELL ["/bin/sh", "-e", "-c"]
 
 # Install build dependencies including cross-compilation tools
 RUN set -eo pipefail && \
