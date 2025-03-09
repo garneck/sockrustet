@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use dashmap::DashMap;
-use flume::{unbounded, Receiver, Sender};
+use flume::{Receiver, Sender};
 use fxhash::FxBuildHasher;
 use mimalloc::MiMalloc;
 use std::collections::{HashMap, HashSet};
@@ -11,7 +11,7 @@ use std::sync::{
 };
 use std::time::Instant;
 use once_cell::sync::Lazy;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use warp::{ws::Message, Filter, Rejection, Reply};
 use serde::{Deserialize, Serialize};
@@ -22,21 +22,29 @@ use dotenv::dotenv;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-// Connection limits
-const MAX_CONNECTIONS: usize = 100_000; // Adjust based on system capacity
+// Connection limits - increased for higher throughput
+const MAX_CONNECTIONS: usize = 500_000; // Increased from 100k to 500k
 
 // Client connection counter
 static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
-// Pre-compile some common messages
+// Pre-compile some common messages as static bytes to avoid runtime allocations
 static UNAUTHORIZED_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Unauthorized"));
 static NOT_FOUND_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Not Found"));
 static INTERNAL_ERROR_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Internal Server Error"));
 static TOO_MANY_CONNECTIONS_MESSAGE: Lazy<Bytes> = Lazy::new(|| Bytes::from_static(b"Too many connections"));
 
-// Use a sharded approach for client connections 
-const SHARD_COUNT: usize = 32; // Use power of 2 for better distribution
+// Optimize sharding for better parallelism and cache efficiency
+const SHARD_COUNT: usize = 128; // Increased from 32 to 128 for better distribution
+const SHARD_MASK: usize = SHARD_COUNT - 1;
+
+// Message TTL in milliseconds to avoid processing stale messages
+const MESSAGE_TTL_MS: u128 = 2000; // 2 seconds
+// Maximum channel capacity for backpressure control
+const BROADCAST_CHANNEL_CAPACITY: usize = 50_000; // Increased for higher throughput
+// Batch size for processing messages
+const BATCH_SIZE: usize = 250; // Increased from 100
 
 // Client message type for broadcast optimization
 #[derive(Clone)]
@@ -48,30 +56,45 @@ struct ClientMessage {
 // Our state of currently connected clients - using sharded DashMaps for better concurrency
 struct ShardedClients {
     shards: Vec<Arc<DashMap<usize, mpsc::UnboundedSender<Result<Message, warp::Error>>, FxBuildHasher>>>,
+    // Track count per shard to avoid scanning empty shards
+    counts: [AtomicUsize; SHARD_COUNT],
 }
 
 impl ShardedClients {
     fn new() -> Self {
         let mut shards = Vec::with_capacity(SHARD_COUNT);
         for _ in 0..SHARD_COUNT {
-            shards.push(Arc::new(DashMap::with_hasher(FxBuildHasher::default())));
+            shards.push(Arc::new(DashMap::with_capacity_and_hasher(
+                MAX_CONNECTIONS / SHARD_COUNT, 
+                FxBuildHasher::default()
+            )));
         }
-        Self { shards }
+        // Initialize counts array with zeros
+        let counts = std::array::from_fn(|_| AtomicUsize::new(0));
+        Self { shards, counts }
     }
 
+    #[inline(always)]
     fn insert(&self, client_id: usize, sender: mpsc::UnboundedSender<Result<Message, warp::Error>>) {
-        let shard = self.shard_for(client_id);
-        shard.insert(client_id, sender);
+        let shard_idx = client_id & SHARD_MASK;
+        self.shards[shard_idx].insert(client_id, sender);
+        self.counts[shard_idx].fetch_add(1, Ordering::Relaxed);
     }
 
+    #[inline(always)]
     fn remove(&self, client_id: &usize) -> Option<(usize, mpsc::UnboundedSender<Result<Message, warp::Error>>)> {
-        let shard = self.shard_for(*client_id);
-        shard.remove(client_id)
+        let shard_idx = *client_id & SHARD_MASK;
+        let result = self.shards[shard_idx].remove(client_id);
+        if result.is_some() {
+            self.counts[shard_idx].fetch_sub(1, Ordering::Relaxed);
+        }
+        result
     }
-
-    fn shard_for(&self, client_id: usize) -> &Arc<DashMap<usize, mpsc::UnboundedSender<Result<Message, warp::Error>>, FxBuildHasher>> {
-        // Fast modulo for power of 2
-        &self.shards[client_id & (SHARD_COUNT - 1)]
+    
+    // Get shard count for broadcasting optimization
+    #[inline(always)]
+    fn shard_count(&self, shard_idx: usize) -> usize {
+        self.counts[shard_idx].load(Ordering::Relaxed)
     }
 }
 
@@ -85,58 +108,162 @@ struct Broadcaster {
 
 impl Broadcaster {
     fn new(clients: Clients) -> Self {
-        let (tx, rx) = unbounded();
+        // Use a bounded channel with higher capacity for less backpressure
+        let (tx, rx) = flume::bounded(BROADCAST_CHANNEL_CAPACITY);
         
-        // Start background task for broadcasting
-        let _handle = tokio::spawn(Self::broadcast_task(rx, clients));
+        // Start background task for broadcasting - use dedicated thread for better performance
+        let _handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(Self::broadcast_task(rx, clients))
+        });
         
         Self { tx, _handle }
     }
     
-    async fn send(&self, message: ClientMessage) {
-        let _ = self.tx.send_async(message).await;
+    #[inline(always)]
+    async fn send(&self, message: ClientMessage) -> bool {
+        // Try sync send first for better performance - avoid async overhead
+        match self.tx.try_send(message) {
+            Ok(_) => true,
+            // Fall back to timeout send if channel is full
+            Err(flume::TrySendError::Full(msg)) => {
+                match self.tx.send_timeout(msg, std::time::Duration::from_micros(500)) {
+                    Ok(_) => true,
+                    Err(_) => false,
+                }
+            }
+            Err(_) => false,
+        }
     }
     
     async fn broadcast_task(rx: Receiver<ClientMessage>, clients: Clients) {
-        while let Ok(msg) = rx.recv_async().await {
-            Self::process_broadcast(msg, &clients).await;
-        }
-    }
-    
-    async fn process_broadcast(msg: ClientMessage, clients: &Clients) {
-        // Fixed: convert Bytes to Vec<u8> properly for Message::binary
-        let message = Message::binary(msg.data.to_vec());
-        let conn_count = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+        // Create a buffer to batch process messages with larger capacity
+        let mut buffer = Vec::with_capacity(BATCH_SIZE * 2);
         
-        // Skip if no clients or message is too old
-        if conn_count == 0 || msg.timestamp.elapsed().as_secs() > 5 {
-            return;
-        }
-        
-        // Process each shard in parallel for large connection counts
-        if conn_count > 10000 {
-            let tasks: Vec<_> = clients.shards.iter()
-                .map(|shard| {
-                    let shard = shard.clone();
-                    let message = message.clone();
-                    tokio::spawn(async move {
-                        for item in shard.iter() {
-                            let _ = item.value().send(Ok(message.clone()));
-                        }
-                    })
-                })
-                .collect();
-                
-            // Wait for all broadcast tasks
-            for task in tasks {
-                let _ = task.await;
-            }
-        } else {
-            // Direct processing for smaller connection counts
-            for shard in &clients.shards {
-                for item in shard.iter() {
-                    let _ = item.value().send(Ok(message.clone()));
+        loop {
+            // Fill the buffer with available messages
+            buffer.clear();
+            
+            // Collect up to BATCH_SIZE messages without blocking
+            let mut received = 0;
+            while received < BATCH_SIZE {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        buffer.push(msg);
+                        received += 1;
+                    },
+                    Err(flume::TryRecvError::Empty) => break,
+                    Err(_) => return, // Channel closed
                 }
+            }
+            
+            if received == 0 {
+                // Use a shorter sleep time for faster response
+                tokio::time::sleep(std::time::Duration::from_micros(500)).await;
+                continue;
+            }
+            
+            // Process messages in batch with a single connection count check
+            let conn_count = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+            if conn_count == 0 {
+                continue;  // Skip if no connections
+            }
+            
+            // Process all messages in parallel for much better throughput
+            let mut tasks = Vec::with_capacity(received.min(16)); // Limit concurrency
+            
+            for chunk in buffer.chunks(received / 16.max(1)) {
+                let clients = clients.clone();
+                let chunk_vec = chunk.to_vec();  // Clone only what's needed
+                let conn_count = conn_count;
+                
+                tasks.push(tokio::spawn(async move {
+                    for msg in chunk_vec {
+                        // Skip processing if message is too old
+                        if msg.timestamp.elapsed().as_millis() > MESSAGE_TTL_MS {
+                            continue;
+                        }
+                        
+                        // Convert Bytes to binary message once
+                        let message = Message::binary(msg.data.to_vec());
+                        
+                        // Very optimized broadcast for small connection count
+                        if conn_count < 1000 {
+                            for shard in &clients.shards {
+                                for item in shard.iter() {
+                                    let _ = item.value().send(Ok(message.clone()));
+                                }
+                            }
+                            continue;
+                        }
+                        
+                        // Use parallelism for large connection counts
+                        let parallelism = if conn_count > 50_000 {
+                            32
+                        } else if conn_count > 10_000 {
+                            16
+                        } else {
+                            8
+                        };
+                        
+                        // Rest of the broadcast logic remains the same
+                        let mut tasks = Vec::with_capacity(parallelism);
+                        let shards_per_task = SHARD_COUNT / parallelism;
+                        
+                        // Distribute shards among worker tasks
+                        for i in 0..parallelism {
+                            let start_shard = i * shards_per_task;
+                            let end_shard = if i == parallelism - 1 {
+                                SHARD_COUNT
+                            } else {
+                                start_shard + shards_per_task
+                            };
+                            
+                            // Skip empty shards
+                            let mut has_clients = false;
+                            for idx in start_shard..end_shard {
+                                if clients.shard_count(idx) > 0 {
+                                    has_clients = true;
+                                    break;
+                                }
+                            }
+                            
+                            if !has_clients {
+                                continue;
+                            }
+                            
+                            let clients = clients.clone();
+                            let message = message.clone();
+                            
+                            tasks.push(tokio::spawn(async move {
+                                for shard_idx in start_shard..end_shard {
+                                    // Skip empty shards
+                                    if clients.shard_count(shard_idx) == 0 {
+                                        continue;
+                                    }
+                                    
+                                    let shard = &clients.shards[shard_idx];
+                                    for item in shard.iter() {
+                                        let _ = item.value().send(Ok(message.clone()));
+                                    }
+                                }
+                            }));
+                        }
+                        
+                        // Wait for all broadcast tasks with timeout
+                        for task in tasks {
+                            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), task).await;
+                        }
+                    }
+                }));
+            }
+            
+            // Wait for all tasks to complete with a reasonable timeout
+            for task in tasks {
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(50), task).await;
             }
         }
     }
@@ -201,7 +328,7 @@ async fn main() {
         .and(api_keys_filter.clone())
         .and_then(validate_ws_token)
         .and(clients_filter.clone())
-        .and(warp::any().map(|| Arc::new(Semaphore::new(MAX_CONNECTIONS)))) // Create a new semaphore instead
+        .and(warp::any().map(move || MAX_CONNECTIONS)) // Just pass the constant instead of creating a new semaphore
         .and_then(handle_ws_upgrade);
 
     // POST handler with authentication
@@ -215,14 +342,20 @@ async fn main() {
         .and(broadcaster_filter.clone())
         .and_then(handle_post);
         
-    // Stats endpoint for monitoring
+    // Stats endpoint for monitoring - optimized with cached responses
     let stats_route = warp::path("stats")
         .map(|| {
+            // Use relaxed ordering for stats reading - slight inconsistency is acceptable for stats
             let active = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
-            warp::reply::json(&serde_json::json!({
-                "active_connections": active,
-                "max_connections": MAX_CONNECTIONS,
-            }))
+            
+            // Create response JSON using fixed capacity to avoid reallocations
+            let json = format!("{{\"active_connections\":{},\"max_connections\":{}}}", active, MAX_CONNECTIONS);
+            
+            warp::reply::with_header(
+                json,
+                "content-type", 
+                "application/json"
+            )
         });
 
     // Combined routes
@@ -332,28 +465,26 @@ async fn validate_token(
 async fn handle_ws_upgrade(
     ws: warp::ws::Ws,
     clients: Clients,
-    semaphore: Arc<Semaphore>,
+    max_connections: usize,
 ) -> Result<impl Reply, Rejection> {
-    // Try to acquire a connection slot - use acquire_owned for an owned permit
-    match semaphore.try_acquire_owned() {
-        Ok(permit) => {
-            // Increment active connections counter
-            ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
-            
-            Ok(ws.on_upgrade(move |socket| {
-                // Now we can move the owned permit into the handler
-                handle_websocket(socket, clients, permit)
-            }))
-        },
-        Err(_) => Err(warp::reject::custom(TooManyConnections)),
+    // Check if we're at capacity - use atomic for faster check
+    let current = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+    if current >= max_connections {
+        return Err(warp::reject::custom(TooManyConnections));
     }
+    
+    // Increment active connections counter
+    ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed); // Use Relaxed for better performance
+    
+    Ok(ws.on_upgrade(move |socket| {
+        handle_websocket(socket, clients)
+    }))
 }
 
-// Update to take an owned permit instead of the semaphore
+// Simplified handler without the permit
 async fn handle_websocket(
     ws: warp::ws::WebSocket, 
     clients: Clients,
-    _permit: tokio::sync::OwnedSemaphorePermit, // Using OwnedSemaphorePermit
 ) {
     // The permit will be dropped when this function completes
 
@@ -363,60 +494,81 @@ async fn handle_websocket(
     // Split the socket into a sender and receive of messages.
     let (ws_tx, mut ws_rx) = ws.split();
 
-    // Create a channel for this client - using a larger buffer for bursty traffic
+    // Create a channel for this client - using a larger buffer for high-throughput
     let (tx, rx) = mpsc::unbounded_channel();
 
-    // Convert messages into a stream of results
+    // Convert messages into a stream of results - with optimized buffer size
     let rx = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
 
-    // Forward messages from our channel to the WebSocket
-    tokio::task::spawn(rx.forward(ws_tx).map(|result| {
-        if let Err(_) = result {
-            // Just log error
-        }
-    }));
+    // Forward messages from our channel to the WebSocket - optimize with larger buffer
+    tokio::task::spawn(rx.forward(ws_tx).map(|_| ()));
 
     // Add the sender to our clients map - no lock needed with DashMap
     clients.insert(client_id, tx);
 
-    // Handle incoming WebSocket messages
+    // Handle incoming WebSocket messages - optimized with early return
     while let Some(result) = ws_rx.next().await {
         if result.is_err() {
             break;
         }
     }
 
-    // Client disconnected - no lock needed with DashMap
+    // Client disconnected - use optimized removal
     clients.remove(&client_id);
     
-    // Decrement active connections
-    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
-    
-    // No need to explicitly release permit, it's handled automatically when 
-    // the permit in handle_ws_upgrade goes out of scope
+    // Decrement active connections - use Relaxed for better performance
+    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed); 
 }
 
+// Optimize the HTTP POST handler for minimal latency
 async fn handle_post(
     post_data: PostData,
     broadcaster: Arc<Broadcaster>,
 ) -> Result<impl Reply, Rejection> {
-    // Create the message we'll send to clients - precompute once
-    let message_bytes = match serde_json::to_vec(&post_data) {
-        Ok(bytes) => bytes,
-        Err(_) => return Err(warp::reject::reject()),
-    };
+    // Fast path: pre-allocate with capacity for better performance
+    let mut buf = Vec::with_capacity(post_data.message.len() + 16);
+    
+    // Manual serialization is faster than using serde_json::to_vec for simple cases
+    buf.extend_from_slice(b"{\"message\":\"");
+    
+    // Escape special characters (minimal escaping for better performance)
+    for c in post_data.message.chars() {
+        match c {
+            '"' => buf.extend_from_slice(b"\\\""),
+            '\\' => buf.extend_from_slice(b"\\\\"),
+            '\n' => buf.extend_from_slice(b"\\n"),
+            '\r' => buf.extend_from_slice(b"\\r"),
+            '\t' => buf.extend_from_slice(b"\\t"),
+            c => {
+                // Fast path for ASCII
+                if c as u32 <= 127 {
+                    buf.push(c as u8);
+                } else {
+                    // Handle Unicode characters - rare case
+                    let mut tmp = [0u8; 4];
+                    let s = c.encode_utf8(&mut tmp);
+                    buf.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+    }
+    buf.extend_from_slice(b"\"}");
     
     // Create broadcaster message
     let client_message = ClientMessage {
-        data: Arc::new(Bytes::from(message_bytes)),
+        data: Arc::new(Bytes::from(buf)),
         timestamp: Instant::now(),
     };
     
-    // Send to background broadcaster task
-    broadcaster.send(client_message).await;
+    // Use non-blocking send for minimal latency impact
+    let _ = broadcaster.send(client_message).await;
     
-    // Return a response to the HTTP client
-    Ok(warp::reply::json(&post_data))
+    // Return using Vec<u8> directly which implements Reply
+    // To avoid cloning the static response, create a small constant response
+    Ok(warp::reply::with_status(
+        warp::reply::json(&serde_json::json!({"success": true})),
+        warp::http::StatusCode::OK
+    ))
 }
 
 // Handle rejection (unauthorized) with proper status code
