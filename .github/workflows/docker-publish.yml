@@ -1,4 +1,4 @@
-name: Publish Scratch Docker image
+name: Publish Scratch Docker image (ARM64 Only)
 
 on:
   push:
@@ -25,7 +25,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # Setup for multi-architecture builds
+      # Setup for ARM64 build
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
         with:
@@ -57,8 +57,9 @@ jobs:
             type=ref,event=branch
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=arm64,enable={{is_default_branch}}
 
-      # Build and push using scratch-optimized settings
+      # Build and push using scratch-optimized settings (ARM64 only)
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
         with:
@@ -66,17 +67,15 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/arm64
           # Improved cache configuration - use a registry cache
           cache-from: |
-            type=gha,scope=docker-build-${{ github.ref_name }}
-            type=gha,scope=docker-build-main
-          cache-to: type=gha,mode=max,scope=docker-build-${{ github.ref_name }}
+            type=gha,scope=docker-build-arm64-${{ github.ref_name }}
+            type=gha,scope=docker-build-arm64-main
+          cache-to: type=gha,mode=max,scope=docker-build-arm64-${{ github.ref_name }}
           # Optimizations for scratch image
           provenance: false
           sbom: false
-          # Build in parallel to save time
-          parallel: true
           # Show build progress
           build-args: |
             BUILDKIT_INLINE_CACHE=1
