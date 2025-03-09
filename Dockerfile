@@ -48,8 +48,22 @@ RUN TARGET=$(cat /target.txt) && \
 
 WORKDIR /app
 
-# Copy source files
-COPY . .
+# Create a dummy main.rs that doesn't need to compile our whole app
+# but will still download our dependencies
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && \
+    echo 'fn main() { println!("Dummy build"); }' > src/main.rs
+
+# Build dependencies only - this layer gets cached
+RUN TARGET=$(cat /target.txt) && \
+    if [ -f /env.sh ]; then source /env.sh; fi && \
+    cargo build --release --target $TARGET && \
+    # Remove the built artifacts but keep the downloaded dependencies in cache
+    cargo clean --release --target $TARGET --package sockrustet && \
+    rm -rf src/
+
+# Now copy the actual source code
+COPY src/ src/
 
 # Build with static linking for the appropriate target
 RUN TARGET=$(cat /target.txt) && \
