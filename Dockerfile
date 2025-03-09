@@ -6,18 +6,24 @@ FROM rustlang/rust:nightly-slim AS builder
 # Enable strict mode
 SHELL ["/bin/sh", "-e", "-c"]
 
-# Optimize for build speed - use all CPU cores
+# Install required dependencies for proc-macros
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Optimize for build speed
 ENV RUSTFLAGS="-C codegen-units=16 -C opt-level=1 -C target-feature=+crt-static"
-# Use all available cores for faster builds (default value)
-# Not setting CARGO_BUILD_JOBS will let cargo decide automatically
 
 WORKDIR /app
 
 # Copy entire project
 COPY . .
 
-# Build directly - no need for cross compilation
+# Build without specifying target to use native architecture 
 RUN echo "Building application..." && \
+    rustc --version && \
+    cargo --version && \
     cargo build --release && \
     cp target/release/sockrustet /app/sockrustet.bin
 
