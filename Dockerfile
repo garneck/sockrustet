@@ -1,5 +1,5 @@
 # Use nightly Rust image to support edition2024
-FROM rustlang/rust:nightly-slim-bullseye AS builder
+FROM rustlang/rust:nightly-bullseye-slim AS builder
 
 # Install cross-compilation tools for ARM64
 RUN apt-get update && apt-get install -y --no-install-recommends \
