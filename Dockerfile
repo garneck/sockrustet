@@ -2,23 +2,30 @@ FROM rust:1.85-slim
 
 WORKDIR /usr/src/app
 
-# Install build dependencies
+# Install build dependencies and debugging tools
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    file \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the entire project
 COPY . .
 
 # Build the application
-RUN cargo build --release
+RUN cargo build --release && \
+    ls -la target/release/ && \
+    file target/release/sockrustet
 
-WORKDIR /app
+# Create app directory
+RUN mkdir -p /app
 
-# Copy the binary to the runtime directory
-RUN cp /usr/src/app/target/release/sockrustet /app/ && \
-    chmod +x /app/sockrustet
+# Copy and verify the binary
+RUN cp target/release/sockrustet /app/ && \
+    chmod +x /app/sockrustet && \
+    ls -la /app && \
+    file /app/sockrustet
 
 # Set environment variables
 ENV RUST_LOG=info
@@ -26,5 +33,5 @@ ENV RUST_LOG=info
 # Expose the port
 EXPOSE 3030
 
-# Run the binary
-CMD ["/app/sockrustet"]
+# Use shell form to provide more context if it fails
+CMD ["/bin/bash", "-c", "ls -la /app && file /app/sockrustet && exec /app/sockrustet"]
