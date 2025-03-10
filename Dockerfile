@@ -1,5 +1,5 @@
 # Use an official Rust runtime as a parent image (ARM64 native)
-FROM rust:1.76-slim-bullseye AS builder
+FROM rust:1.85-slim-bullseye AS builder
 
 # Set working directory
 WORKDIR /usr/src/app
