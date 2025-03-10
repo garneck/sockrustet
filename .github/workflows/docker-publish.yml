@@ -11,14 +11,18 @@ env:
 
 jobs:
   build:
-    runs-on: [self-hosted, linux, ARM64]
+    # Use an ARM64 runner
+    runs-on: [self-hosted, linux, ARM64] # Or use GitHub's ARM64 runners when available
 
     steps:
+      # Checkout the code
       - uses: actions/checkout@v4
 
+      # Set up Docker Buildx (no QEMU needed for native build)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Login to Docker Hub (optional)
       - name: Login to Docker Hub
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: docker/login-action@v3
@@ -31,9 +35,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # No need for platforms specification since it's native
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           tags: |
-            yourusername/your-service-name:latest
-            yourusername/your-service-name:${{ github.sha }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
+            garneck/sockrustet:latest
+            garneck/sockrustet:${{ github.sha }}
