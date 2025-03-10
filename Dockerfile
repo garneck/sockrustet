@@ -1,5 +1,5 @@
 # Use Rust nightly as the base image for ARM64
-FROM rust:nightly-slim-bullseye AS builder
+FROM rust:nightly-bullseye-slim AS builder
 
 # Set working directory
 WORKDIR /usr/src/app
