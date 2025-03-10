@@ -1,20 +1,28 @@
-# Use an official Rust runtime as a parent image (ARM64 native)
-FROM rust:1.85-slim-bullseye AS builder
+# Use Rust nightly as the base image for ARM64
+FROM rust:nightly-slim-bullseye AS builder
 
 # Set working directory
 WORKDIR /usr/src/app
 
+# Install necessary dependencies (none needed beyond base image for now)
+RUN apt-get update && apt-get install -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Rust toolchain to nightly explicitly
+RUN rustup update && rustup default nightly
+
 # Copy the Cargo files first for better caching
 COPY Cargo.toml Cargo.lock ./
 
-# Create a dummy main.rs to cache dependencies
-RUN mkdir src && echo "fn main() { println!(\"Hello, world!\"); }" > src/main.rs
-RUN cargo build --release
+# Fetch dependencies without building a binary
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo fetch
+# Clean up the dummy file to avoid confusion
+RUN rm -rf src
 
 # Copy the actual source code
 COPY src ./src
 
-# Build the application (native ARM64)
+# Build the application (native ARM64 with edition2024)
 RUN cargo build --release
 
 # Create runtime image

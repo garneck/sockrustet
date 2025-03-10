@@ -11,18 +11,14 @@ env:
 
 jobs:
   build:
-    # Use an ARM64 runner
-    runs-on: [self-hosted, linux, ARM64] # Or use GitHub's ARM64 runners when available
+    runs-on: [self-hosted, linux, ARM64]
 
     steps:
-      # Checkout the code
       - uses: actions/checkout@v4
 
-      # Set up Docker Buildx (no QEMU needed for native build)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Login to Docker Hub (optional)
       - name: Login to Docker Hub
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: docker/login-action@v3
@@ -35,20 +31,9 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          # No need for platforms specification since it's native
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: |
-            garneck/sockrustet:latest
-            garneck/sockrustet:${{ github.sha }}
-
-      # Cache Rust dependencies
-      - name: Cache Rust dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+            yourusername/your-service-name:latest
+            yourusername/your-service-name:${{ github.sha }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
