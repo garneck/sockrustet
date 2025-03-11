@@ -175,7 +175,8 @@ impl Broadcaster {
             // Process all messages in parallel for much better throughput
             let mut tasks = Vec::with_capacity(received.min(16)); // Limit concurrency
             
-            for chunk in buffer.chunks(received / 16.max(1)) {
+            // Fix the chunk size calculation to ensure it's never zero
+            for chunk in buffer.chunks(std::cmp::max(1, received / 16.max(1))) {
                 let clients = clients.clone();
                 let chunk_vec = chunk.to_vec();  // Clone only what's needed
                 let conn_count = conn_count;
